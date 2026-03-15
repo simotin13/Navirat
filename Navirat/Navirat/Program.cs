@@ -10,6 +10,18 @@ internal static class Program
         ApplicationConfiguration.Initialize();
         Application.EnableVisualStyles();
         Application.SetCompatibleTextRenderingDefault(false);
-        Application.Run(new MainForm());
+
+        // スプラッシュスクリーンを別スレッドで表示しながら MainForm を初期化
+        using var splash = new SplashForm();
+        splash.Show();
+        Application.DoEvents();
+
+        var mainForm = new MainForm();
+
+        // スプラッシュが閉じるまで待機してから MainForm を表示
+        while (splash.Visible)
+            Application.DoEvents();
+
+        Application.Run(mainForm);
     }
 }

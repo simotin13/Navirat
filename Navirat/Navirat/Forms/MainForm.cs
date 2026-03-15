@@ -45,7 +45,8 @@ public class MainForm : Form
         Size = new Size(1280, 800);
         StartPosition = FormStartPosition.CenterScreen;
         Font = new Font("Meiryo UI", 9f);
-        Icon = SystemIcons.Application;
+        var iconPath = Path.Combine(AppContext.BaseDirectory, "Resources", "mouse.ico");
+        Icon = File.Exists(iconPath) ? new Icon(iconPath) : SystemIcons.Application;
 
         // ImageList（ツリーアイコン用）
         var imageList = new ImageList { ImageSize = new Size(16, 16) };

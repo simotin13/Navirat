@@ -8,8 +8,18 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <AssemblyName>Navirat</AssemblyName>
     <RootNamespace>Navirat</RootNamespace>
+    <ApplicationIcon>Resources\mouse.ico</ApplicationIcon>
 <AllowUnsafeBlocks>false</AllowUnsafeBlocks>
   </PropertyGroup>
+
+  <ItemGroup>
+    <Content Include="Resources\mouse.ico">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+    <Content Include="Resources\splash.png">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+  </ItemGroup>
 
   <ItemGroup>
     <PackageReference Include="MySqlConnector" Version="2.3.7" />
