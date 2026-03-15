@@ -244,6 +244,48 @@ public class DatabaseService : IDisposable
         await cmd.ExecuteNonQueryAsync(cancellationToken);
     }
 
+    /// <summary>
+    /// 指定DBの全テーブルを外部キー制約を一時無効にして DROP します。
+    /// 成功数・失敗数とエラー一覧を返します。
+    /// </summary>
+    public async Task<(int Dropped, int Failed, List<string> Errors)> DropAllTablesAsync(
+        string dbName,
+        CancellationToken cancellationToken = default)
+    {
+        var tables = await GetTablesAsync(dbName, cancellationToken);
+        int dropped = 0, failed = 0;
+        var errors  = new List<string>();
+
+        await using var conn = await OpenConnectionAsync(cancellationToken);
+
+        // 外部キー制約を一時無効化
+        await using (var fkOff = new MySqlCommand("SET FOREIGN_KEY_CHECKS = 0", conn))
+            await fkOff.ExecuteNonQueryAsync(cancellationToken);
+
+        foreach (var (name, _, _, _) in tables)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            try
+            {
+                await using var cmd = new MySqlCommand(
+                    $"DROP TABLE `{Esc(dbName)}`.`{Esc(name)}`", conn);
+                await cmd.ExecuteNonQueryAsync(cancellationToken);
+                dropped++;
+            }
+            catch (Exception ex)
+            {
+                failed++;
+                errors.Add($"`{name}`: {ex.Message}");
+            }
+        }
+
+        // 外部キー制約を再有効化
+        await using (var fkOn = new MySqlCommand("SET FOREIGN_KEY_CHECKS = 1", conn))
+            await fkOn.ExecuteNonQueryAsync(CancellationToken.None);
+
+        return (dropped, failed, errors);
+    }
+
     public async Task AddColumnAsync(string dbName, string tableName,
         Models.ColumnDefinition column, string? afterColumn = null,
         CancellationToken cancellationToken = default)
@@ -465,6 +507,9 @@ public class DatabaseService : IDisposable
 
     /// <summary>
     /// SQL スクリプトを1接続で順次実行する。インポート処理に使用。
+    /// DML (INSERT/UPDATE/DELETE/REPLACE) は BatchSize 件ずつ1回の COM_QUERY で送信し、
+    /// CommitEvery 件ごとにまとめてコミットすることで高速化します。
+    /// バッチ送信に失敗した場合は1件ずつ個別実行にフォールバックします。
     /// </summary>
     public async Task<(int Success, int Failed, List<string> Errors)> ExecuteScriptAsync(
         string sql,
@@ -472,39 +517,311 @@ public class DatabaseService : IDisposable
         IProgress<(int Current, int Total)>? progress = null,
         CancellationToken cancellationToken = default)
     {
+        // コメントのみのステートメントを除外して事前にリスト化
         var statements = SplitSqlStatements(sql)
             .Select(s => s.Trim())
-            .Where(s => !string.IsNullOrEmpty(s))
+            .Where(s => s.Length > 0 && !IsCommentOnly(s))
             .ToList();
 
         int success = 0, failed = 0;
         var errors = new List<string>();
 
+        // DML を何件まとめて1回の COM_QUERY で送るか（マルチステートメント送信）
+        const int BatchSize = 50;
+        // DML を何件ごとにコミットするか
+        const int CommitEvery = 10_000;
+
+        var dmlBatch = new List<string>(BatchSize);
+        int uncommittedDml = 0;
+
+        // MySqlConnector はマルチステートメントをデフォルトでサポートするため通常の接続で OK
         await using var conn = await OpenConnectionAsync(cancellationToken);
 
-        for (int i = 0; i < statements.Count; i++)
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-            progress?.Report((i + 1, statements.Count));
+        // autocommit を無効化
+        await using (var acCmd = new MySqlCommand("SET autocommit = 0", conn))
+            await acCmd.ExecuteNonQueryAsync(cancellationToken);
 
-            var stmt = statements[i];
+        // 未コミット DML をコミットするローカル関数
+        async Task CommitPendingAsync()
+        {
+            if (uncommittedDml == 0) return;
+            await using var commitCmd = new MySqlCommand("COMMIT", conn);
+            await commitCmd.ExecuteNonQueryAsync(CancellationToken.None);
+            uncommittedDml = 0;
+        }
+
+        // DML バッチを1回の COM_QUERY で送信するローカル関数
+        // 失敗した場合は1件ずつ個別実行にフォールバックする
+        async Task FlushDmlBatchAsync()
+        {
+            if (dmlBatch.Count == 0) return;
+
+            var snapshot = dmlBatch.ToList();
+            dmlBatch.Clear();
+
+            // バッチが1件なら SAVEPOINT 不要で直接実行
+            if (snapshot.Count == 1)
+            {
+                try
+                {
+                    await using var singleCmd = new MySqlCommand(snapshot[0], conn) { CommandTimeout = 300 };
+                    await singleCmd.ExecuteNonQueryAsync(cancellationToken);
+                    success++;
+                    uncommittedDml++;
+                    if (uncommittedDml >= CommitEvery) await CommitPendingAsync();
+                }
+                catch (Exception ex)
+                {
+                    failed++;
+                    var preview = snapshot[0].Length > 120 ? snapshot[0][..120] + "..." : snapshot[0];
+                    errors.Add($"{ex.Message}  →  {preview}");
+                    if (!continueOnError)
+                    {
+                        try { await using var rb = new MySqlCommand("ROLLBACK", conn); await rb.ExecuteNonQueryAsync(CancellationToken.None); } catch { }
+                        throw new Exception($"エラーが発生しました:\n{ex.Message}");
+                    }
+                }
+                return;
+            }
+
+            // SAVEPOINT を設定してバッチ送信
+            const string SavepointName = "_nb";
             try
             {
-                await using var cmd = new MySqlCommand(stmt, conn) { CommandTimeout = 300 };
-                await cmd.ExecuteNonQueryAsync(cancellationToken);
-                success++;
+                await using (var spCmd = new MySqlCommand($"SAVEPOINT {SavepointName}", conn))
+                    await spCmd.ExecuteNonQueryAsync(cancellationToken);
             }
-            catch (Exception ex)
+            catch
             {
-                failed++;
-                var preview = stmt.Length > 120 ? stmt[..120] + "..." : stmt;
-                errors.Add($"[{i + 1}] {ex.Message}  →  {preview}");
-                if (!continueOnError)
-                    throw new Exception($"ステートメント {i + 1} でエラーが発生しました:\n{ex.Message}");
+                // SAVEPOINT が失敗した場合は個別実行にフォールバック
+                foreach (var s in snapshot)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    try
+                    {
+                        await using var fb = new MySqlCommand(s, conn) { CommandTimeout = 300 };
+                        await fb.ExecuteNonQueryAsync(cancellationToken);
+                        success++; uncommittedDml++;
+                        if (uncommittedDml >= CommitEvery) await CommitPendingAsync();
+                    }
+                    catch (Exception ex2)
+                    {
+                        failed++;
+                        var p = s.Length > 120 ? s[..120] + "..." : s;
+                        errors.Add($"{ex2.Message}  →  {p}");
+                        if (!continueOnError)
+                        {
+                            try { await using var rb = new MySqlCommand("ROLLBACK", conn); await rb.ExecuteNonQueryAsync(CancellationToken.None); } catch { }
+                            throw new Exception($"エラーが発生しました:\n{ex2.Message}");
+                        }
+                    }
+                }
+                return;
+            }
+
+            // マルチステートメントを1回の COM_QUERY で送信
+            var batchSql = string.Join(";\n", snapshot);
+            bool batchOk = false;
+            try
+            {
+                await using var batchCmd = new MySqlCommand(batchSql, conn) { CommandTimeout = 300 };
+                await batchCmd.ExecuteNonQueryAsync(cancellationToken);
+                batchOk = true;
+            }
+            catch
+            {
+                // バッチ失敗 → SAVEPOINT までロールバック
+                try
+                {
+                    await using var rbSp = new MySqlCommand($"ROLLBACK TO SAVEPOINT {SavepointName}", conn);
+                    await rbSp.ExecuteNonQueryAsync(CancellationToken.None);
+                }
+                catch { }
+            }
+
+            // SAVEPOINT を解放
+            try
+            {
+                await using var relCmd = new MySqlCommand($"RELEASE SAVEPOINT {SavepointName}", conn);
+                await relCmd.ExecuteNonQueryAsync(CancellationToken.None);
+            }
+            catch { }
+
+            if (batchOk)
+            {
+                success += snapshot.Count;
+                uncommittedDml += snapshot.Count;
+                if (uncommittedDml >= CommitEvery) await CommitPendingAsync();
+                return;
+            }
+
+            // バッチ失敗時は1件ずつ個別実行にフォールバック
+            foreach (var s in snapshot)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                try
+                {
+                    await using var fallbackCmd = new MySqlCommand(s, conn) { CommandTimeout = 300 };
+                    await fallbackCmd.ExecuteNonQueryAsync(cancellationToken);
+                    success++;
+                    uncommittedDml++;
+                    if (uncommittedDml >= CommitEvery) await CommitPendingAsync();
+                }
+                catch (Exception ex)
+                {
+                    failed++;
+                    var preview = s.Length > 120 ? s[..120] + "..." : s;
+                    errors.Add($"{ex.Message}  →  {preview}");
+                    if (!continueOnError)
+                    {
+                        try { await using var rb = new MySqlCommand("ROLLBACK", conn); await rb.ExecuteNonQueryAsync(CancellationToken.None); } catch { }
+                        throw new Exception($"エラーが発生しました:\n{ex.Message}");
+                    }
+                }
             }
         }
 
+        try
+        {
+            for (int i = 0; i < statements.Count; i++)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+
+                // 進捗は 20 件ごとに通知（体感速度とUIオーバーヘッドのバランス）
+                if (i % 20 == 0 || i == statements.Count - 1)
+                    progress?.Report((i + 1, statements.Count));
+
+                var stmt = statements[i];
+                bool isDml = IsDmlStatement(stmt);
+
+                if (isDml)
+                {
+                    // DML はバッチに積む
+                    dmlBatch.Add(stmt);
+                    if (dmlBatch.Count >= BatchSize)
+                        await FlushDmlBatchAsync();
+                }
+                else
+                {
+                    // 非DML（DDL / USE / SET 等）の前にバッチをフラッシュしてコミット
+                    await FlushDmlBatchAsync();
+                    if (uncommittedDml > 0) await CommitPendingAsync();
+
+                    try
+                    {
+                        await using var cmd = new MySqlCommand(stmt, conn) { CommandTimeout = 300 };
+                        await cmd.ExecuteNonQueryAsync(cancellationToken);
+                        success++;
+                    }
+                    catch (Exception ex)
+                    {
+                        failed++;
+                        var preview = stmt.Length > 120 ? stmt[..120] + "..." : stmt;
+                        errors.Add($"[{i + 1}] {ex.Message}  →  {preview}");
+
+                        if (!continueOnError)
+                        {
+                            try
+                            {
+                                await using var rollCmd = new MySqlCommand("ROLLBACK", conn);
+                                await rollCmd.ExecuteNonQueryAsync(CancellationToken.None);
+                            }
+                            catch { }
+                            throw new Exception($"ステートメント {i + 1} でエラーが発生しました:\n{ex.Message}");
+                        }
+                    }
+                }
+            }
+
+            // 残りのバッチをフラッシュしてコミット
+            await FlushDmlBatchAsync();
+            await CommitPendingAsync();
+        }
+        catch (OperationCanceledException)
+        {
+            // キャンセル時はロールバック
+            try
+            {
+                await using var rollCmd = new MySqlCommand("ROLLBACK", conn);
+                await rollCmd.ExecuteNonQueryAsync(CancellationToken.None);
+            }
+            catch { }
+            throw;
+        }
+        finally
+        {
+            // autocommit を元の状態に戻す
+            try
+            {
+                await using var restoreCmd = new MySqlCommand("SET autocommit = 1", conn);
+                await restoreCmd.ExecuteNonQueryAsync(CancellationToken.None);
+            }
+            catch { }
+        }
+
         return (success, failed, errors);
+    }
+
+    /// <summary>コメント行と空行だけで構成されるステートメントか判定する。</summary>
+    private static bool IsCommentOnly(string stmt)
+    {
+        // 高速パス: 先頭が英字・数字ならSQL文なので即 false（Split を回避）
+        var span = stmt.AsSpan().TrimStart();
+        if (span.IsEmpty) return true;
+        char first = span[0];
+        if (char.IsAsciiLetter(first) || char.IsAsciiDigit(first) || first == '`' || first == '(')
+            return false;
+        // 先頭がコメント記号でなければ false
+        if (!span.StartsWith("--", StringComparison.Ordinal) &&
+            !span.StartsWith("/*", StringComparison.Ordinal))
+            return false;
+
+        // 低速パス: 全行をスキャン（コメントで始まるステートメントのみ到達）
+        foreach (var line in stmt.Split('\n'))
+        {
+            var t = line.Trim();
+            if (t.Length > 0
+                && !t.StartsWith("--", StringComparison.Ordinal)
+                && !t.StartsWith("/*", StringComparison.Ordinal)
+                && !t.StartsWith("*/", StringComparison.Ordinal)
+                && !t.StartsWith("* ",  StringComparison.Ordinal)
+                && t != "*")
+                return false;
+        }
+        return true;
+    }
+
+    /// <summary>DML ステートメント (INSERT/UPDATE/DELETE/REPLACE) か判定する。</summary>
+    private static bool IsDmlStatement(string stmt)
+    {
+        // 高速パス: Span で先頭をチェック（Split/LINQ を回避）
+        var span = stmt.AsSpan().TrimStart();
+        if (span.IsEmpty) return false;
+
+        // 先頭がコメントでなければ直接判定できる（99%のケース）
+        if (!span.StartsWith("--", StringComparison.Ordinal) &&
+            !span.StartsWith("/*", StringComparison.Ordinal))
+        {
+            return span.StartsWith("INSERT",  StringComparison.OrdinalIgnoreCase) ||
+                   span.StartsWith("UPDATE",  StringComparison.OrdinalIgnoreCase) ||
+                   span.StartsWith("DELETE",  StringComparison.OrdinalIgnoreCase) ||
+                   span.StartsWith("REPLACE", StringComparison.OrdinalIgnoreCase);
+        }
+
+        // 低速パス: コメントで始まるステートメントの場合に最初の非コメント行を探す
+        foreach (var line in stmt.Split('\n'))
+        {
+            var t = line.TrimStart();
+            if (t.Length == 0 ||
+                t.StartsWith("--", StringComparison.Ordinal) ||
+                t.StartsWith("/*", StringComparison.Ordinal)) continue;
+
+            return t.StartsWith("INSERT",  StringComparison.OrdinalIgnoreCase) ||
+                   t.StartsWith("UPDATE",  StringComparison.OrdinalIgnoreCase) ||
+                   t.StartsWith("DELETE",  StringComparison.OrdinalIgnoreCase) ||
+                   t.StartsWith("REPLACE", StringComparison.OrdinalIgnoreCase);
+        }
+        return false;
     }
 
     // =============================================

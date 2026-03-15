@@ -496,6 +496,11 @@ public class MainForm : Form
 
                     menu.Items.Add(new ToolStripSeparator());
 
+                    var dropAllTablesItem = new ToolStripMenuItem("全てのテーブルを削除...");
+                    dropAllTablesItem.ForeColor = Color.DarkRed;
+                    dropAllTablesItem.Click += (s, e) => _ = DropAllTablesAsync(tag, node);
+                    menu.Items.Add(dropAllTablesItem);
+
                     var dropDbItem = new ToolStripMenuItem("データベースを削除...");
                     dropDbItem.ForeColor = Color.DarkRed;
                     dropDbItem.Click += (s, e) => DropDatabase(tag.ConnectionName, tag.Database!, node);
@@ -613,6 +618,77 @@ public class MainForm : Form
         catch (Exception ex)
         {
             MessageBox.Show($"削除に失敗しました。\n{ex.Message}", "エラー", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+    }
+
+    private async Task DropAllTablesAsync(NodeTag tag, TreeNode dbNode)
+    {
+        if (!_activeConnections.TryGetValue(tag.ConnectionName, out var conn)) return;
+
+        // テーブル数を先に取得して確認ダイアログに表示
+        int tableCount;
+        try
+        {
+            var tables = await conn.DbService.GetTablesAsync(tag.Database!);
+            tableCount = tables.Count(t => t.Type != "VIEW");  // ビュー以外のテーブル数
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show($"テーブル一覧の取得に失敗しました。\n{ex.Message}", "エラー",
+                MessageBoxButtons.OK, MessageBoxIcon.Error);
+            return;
+        }
+
+        if (tableCount == 0)
+        {
+            MessageBox.Show($"データベース '{tag.Database}' に削除するテーブルはありません。",
+                "全テーブルを削除", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        var confirm = MessageBox.Show(
+            $"データベース '{tag.Database}' の全テーブル ({tableCount} 件) を削除しますか？\n\n" +
+            "全データとテーブル構造が失われます。この操作は元に戻せません。",
+            "全テーブルを削除",
+            MessageBoxButtons.YesNo,
+            MessageBoxIcon.Warning);
+
+        if (confirm != DialogResult.Yes) return;
+
+        SetStatus($"'{tag.Database}' の全テーブルを削除中...");
+        Cursor = Cursors.WaitCursor;
+        try
+        {
+            var (dropped, failed, errors) = await conn.DbService.DropAllTablesAsync(tag.Database!);
+
+            // ツリーノードを更新
+            await LoadTablesAsync(dbNode, conn.DbService);
+            dbNode.Expand();
+
+            if (failed == 0)
+            {
+                SetStatus($"'{tag.Database}' の全テーブル ({dropped} 件) を削除しました。");
+                MessageBox.Show($"{dropped} 件のテーブルを削除しました。",
+                    "全テーブルを削除", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }
+            else
+            {
+                var detail = string.Join("\n", errors.Take(10));
+                SetStatus($"'{tag.Database}' のテーブル削除完了（成功: {dropped}、失敗: {failed}）。");
+                MessageBox.Show(
+                    $"削除完了：成功 {dropped} 件、失敗 {failed} 件。\n\nエラー詳細:\n{detail}",
+                    "全テーブルを削除", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
+        }
+        catch (Exception ex)
+        {
+            SetStatus("テーブル削除に失敗しました。");
+            MessageBox.Show($"テーブル削除に失敗しました。\n{ex.Message}", "エラー",
+                MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+        finally
+        {
+            Cursor = Cursors.Default;
         }
     }
 

@@ -28,6 +28,7 @@ public class SqlImportExportForm : Form
     private CheckBox chkIncludeData = null!;
     private CheckBox chkDropTable = null!;
     private CheckBox chkFkChecks = null!;
+    private CheckBox chkUniqueChecks = null!;
     private CheckBox chkContinueOnError = null!;
     private ProgressBar progressBar = null!;
     private Label lblProgress = null!;
@@ -79,7 +80,7 @@ public class SqlImportExportForm : Form
         };
 
         // ===== ② 設定パネル（Top） =====
-        int cfgHeight = isExport ? 210 : 85;
+        int cfgHeight = isExport ? 210 : 115;
         var configPanel = new Panel { Dock = DockStyle.Top, Height = cfgHeight, Padding = new Padding(8, 4, 8, 4) };
 
         if (isExport)
@@ -130,9 +131,11 @@ public class SqlImportExportForm : Form
             {
                 Text = "オプション", Dock = DockStyle.Fill, Margin = new Padding(0)
             };
-            chkContinueOnError = new CheckBox { Text = "エラーが発生しても続行する", Left = 10, Top = 22, Width = 300, Checked = true };
-            chkFkChecks        = new CheckBox { Text = "外部キー制約を無効化 (FK_CHECKS=0)", Left = 10, Top = 48, Width = 300, Checked = true };
-            grpOpt.Controls.AddRange([chkContinueOnError, chkFkChecks]);
+            chkContinueOnError = new CheckBox { Text = "エラーが発生しても続行する",              Left = 10, Top = 22, Width = 340, Checked = true };
+            chkFkChecks        = new CheckBox { Text = "外部キー制約を無効化 (FK_CHECKS=0)",      Left = 10, Top = 48, Width = 340, Checked = true };
+            chkUniqueChecks    = new CheckBox { Text = "インデックス重複チェックを無効化 (UNIQUE_CHECKS=0)  ※データに重複がない場合のみ",
+                                                Left = 10, Top = 74, Width = 500, Checked = false };
+            grpOpt.Controls.AddRange([chkContinueOnError, chkFkChecks, chkUniqueChecks]);
             configPanel.Controls.Add(grpOpt);
         }
 
@@ -502,19 +505,24 @@ public class SqlImportExportForm : Form
             return;
         }
 
-        bool continueOnError = chkContinueOnError?.Checked ?? true;
-        bool disableFk       = chkFkChecks?.Checked        ?? true;
+        bool continueOnError  = chkContinueOnError?.Checked ?? true;
+        bool disableFk        = chkFkChecks?.Checked        ?? true;
+        bool disableUnique    = chkUniqueChecks?.Checked    ?? false;
 
         Log($"インポート開始: {txtFilePath.Text}", Color.Cyan);
         Log($"対象 DB: {_dbName}");
+        Log($"FK_CHECKS: {(disableFk ? "無効" : "有効")}  " +
+            $"UNIQUE_CHECKS: {(disableUnique ? "無効" : "有効")}  " +
+            $"バッチコミット: 5000件ごと");
         Log("");
 
         var rawSql = await File.ReadAllTextAsync(txtFilePath.Text, Encoding.UTF8, ct);
 
-        // USE / FK_CHECKS を先頭に注入
+        // USE / セッション変数を先頭に注入
         var header = new StringBuilder();
         header.AppendLine($"USE `{_dbName}`;");
-        if (disableFk) header.AppendLine("SET FOREIGN_KEY_CHECKS = 0;");
+        if (disableFk)     header.AppendLine("SET FOREIGN_KEY_CHECKS = 0;");
+        if (disableUnique) header.AppendLine("SET UNIQUE_CHECKS = 0;");
         var sql = header + rawSql;
 
         int lastReported = 0;
@@ -524,8 +532,8 @@ public class SqlImportExportForm : Form
             progressBar.Value   = Math.Min(p.Current, p.Total);
             lblProgress.Text    = $"ステートメント {p.Current:N0} / {p.Total:N0}";
 
-            // 50件ごとにログ出力
-            if (p.Current - lastReported >= 50 || p.Current == p.Total)
+            // 200件ごとにログ出力（体感と RichTextBox 追記コストのバランス）
+            if (p.Current - lastReported >= 200 || p.Current == p.Total)
             {
                 Log($"  [{p.Current:N0} / {p.Total:N0}] 実行中...");
                 lastReported = p.Current;
@@ -537,6 +545,11 @@ public class SqlImportExportForm : Form
         if (disableFk)
         {
             try { await _dbService.ExecuteNonQueryAsync("SET FOREIGN_KEY_CHECKS = 1;", ct); }
+            catch { /* 無視 */ }
+        }
+        if (disableUnique)
+        {
+            try { await _dbService.ExecuteNonQueryAsync("SET UNIQUE_CHECKS = 1;", ct); }
             catch { /* 無視 */ }
         }
 
