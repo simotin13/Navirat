@@ -76,6 +76,7 @@ public class MainForm : Form
         treeView.NodeMouseDoubleClick += TreeView_NodeMouseDoubleClick;
         treeView.NodeMouseClick += TreeView_NodeMouseClick;
         treeView.AfterExpand += TreeView_AfterExpand;
+        treeView.AfterSelect += TreeView_AfterSelect;
 
         // 右パネル
         rightPanel = new Panel { Dock = DockStyle.Fill };
@@ -362,6 +363,19 @@ public class MainForm : Form
         catch (Exception ex)
         {
             SetStatus($"ロードエラー: {ex.Message}");
+        }
+    }
+
+    private void TreeView_AfterSelect(object? sender, TreeViewEventArgs e)
+    {
+        if (e.Node?.Tag is not NodeTag tag) return;
+        if (tag.Database == null) return;  // Connection ノードは対象外
+
+        // 開いているすべてのクエリエディタの接続/DB を同期する
+        foreach (TabPage tab in tabMain.TabPages)
+        {
+            var editor = tab.Controls.OfType<QueryEditorControl>().FirstOrDefault();
+            editor?.SetConnectionAndDatabase(tag.ConnectionName, tag.Database);
         }
     }
 
@@ -703,11 +717,16 @@ public class MainForm : Form
     {
         string title = $"クエリ {tabMain.TabCount + 1}";
 
-        DatabaseService? dbService = null;
-        if (connectionName != null && _activeConnections.TryGetValue(connectionName, out var conn))
-            dbService = conn.DbService;
+        // 接続/DBが未指定の場合はツリービューで現在選択中のノードから取得
+        if (connectionName == null && treeView.SelectedNode?.Tag is NodeTag selTag
+            && _activeConnections.ContainsKey(selTag.ConnectionName))
+        {
+            connectionName = selTag.ConnectionName;
+            dbName ??= selTag.Database;
+        }
 
-        var editor = new QueryEditorControl(dbService, dbName)
+        // _activeConnections の参照をそのまま渡す（後から追加された接続も参照可能）
+        var editor = new QueryEditorControl(_activeConnections, connectionName, dbName)
         {
             Dock = DockStyle.Fill
         };

@@ -378,7 +378,15 @@ public class DatabaseService : IDisposable
             try
             {
                 var trimmed = stmt.Trim();
-                var upper   = trimmed.ToUpperInvariant();
+
+                // コメント行（-- ...）と空行をスキップして最初の実SQL行でステートメント種別を判定
+                var firstSqlLine = trimmed.Split('\n')
+                    .Select(l => l.Trim())
+                    .FirstOrDefault(l => l.Length > 0
+                                        && !l.StartsWith("--")
+                                        && !l.StartsWith("/*"))
+                    ?? trimmed;
+                var upper = firstSqlLine.ToUpperInvariant();
 
                 if (upper.StartsWith("SELECT") || upper.StartsWith("SHOW") ||
                     upper.StartsWith("DESCRIBE") || upper.StartsWith("EXPLAIN") ||
